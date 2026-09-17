@@ -1,19 +1,27 @@
 import datetime
 import math
-from statistics import StatisticsError, linear_regression
 import time
 import xml.etree.ElementTree as ET
 import requests
+import sqlite3
+import numpy as np
 
 # --- ASETUKSET ---
-KANAVA = "saa-testi666"  # Vaihda oma ntfy-kanavasi
-FMISID = 101004  # Helsinki-Vantaan lentoasema
+KANAVA = "saa-testi666" 
+FMISID = 101004  # Helsinki-Vantaa METAR
 LATITUDE = 60.3172
 LONGITUDE = 24.9633
+DB_FILE = "saabotti_v2.db"
 
+# --- TIETOKANTA JA LOGITUS ---
+def init_db():
+    with sqlite3.connect(DB_FILE) as conn:
+        # Tallennetaan toteutuneet ja ennustetut vertailua varten
+        conn.execute("""CREATE TABLE IF NOT EXISTS logs 
+            (date TEXT PRIMARY KEY, predicted REAL, actual REAL, model_version TEXT)""")
+        conn.commit()
 
 def laheta_puhelimeen(otsikko, viesti):
-    """Lähettää ilmoituksen puhelimeen ntfy.sh-palvelun kautta."""
     try:
         requests.post(
             f"https://ntfy.sh/{KANAVA}",
@@ -24,169 +32,123 @@ def laheta_puhelimeen(otsikko, viesti):
     except Exception as e:
         print(f"Viestivirhe: {e}")
 
-
-def opeta_korjausmalli():
-    """Hakee edellisen 30 pv ennusteet ja FMI-toteumat, ja laskee korjauskertoimet."""
-    print("Haetaan historiaa ja kalibroidaan ennustemallia...")
-
+# --- DATA-HAKU ---
+def hae_fmi_historia(paivat=35):
     tanaan = datetime.date.today()
-    alku_pvm = (tanaan - datetime.timedelta(days=32)).strftime("%Y-%m-%d")
-    loppu_pvm = (tanaan - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-
-    # 1. Haetaan menneet ennusteet (Open-Meteo)
-    ennuste_historia = {}
+    alku = (tanaan - datetime.timedelta(days=paivat)).strftime("%Y-%m-%dT00:00:00Z")
+    loppu = (tanaan - datetime.timedelta(days=1)).strftime("%Y-%m-%dT23:59:59Z")
+    
+    url = "https://opendata.fmi.fi/wfs"
+    params = {
+        "service": "WFS", "version": "2.0.0", "request": "getFeature",
+        "storedquery_id": "fmi::observations::weather::daily::simple",
+        "fmisid": FMISID, "parameters": "tmax", "starttime": alku, "endtime": loppu
+    }
     try:
-        url = "https://api.open-meteo.com/v1/forecast"
-        params = {
-            "latitude": LATITUDE,
-            "longitude": LONGITUDE,
-            "past_days": 31,
-            "forecast_days": 0,
-            "daily": ["temperature_2m_max"],
-            "models": ["ecmwf_ifs025", "dwd_icon"],
-            "timezone": "Europe/Helsinki",
-        }
-        res = requests.get(url, params=params, timeout=15).json()
-        paivat = res["daily"]["time"]
-        ecmwf = res["daily"]["temperature_2m_max_ecmwf_ifs025"]
-        icon = res["daily"]["temperature_2m_max_dwd_icon"]
-
-        for d, m1, m2 in zip(paivat, ecmwf, icon):
-            if m1 is not None and m2 is not None:
-                ennuste_historia[d] = (m1 * 0.6) + (m2 * 0.4)
-    except Exception as e:
-        print(f"Ennustehistorian noutovirhe: {e}")
-
-    # 2. Haetaan menneet toteutuneet maksimilämmöt (FMI)
-    fmi_historia = {}
-    try:
-        alku_iso = (tanaan - datetime.timedelta(days=32)).strftime(
-            "%Y-%m-%dT00:00:00Z"
-        )
-        loppu_iso = (tanaan - datetime.timedelta(days=1)).strftime(
-            "%Y-%m-%dT23:59:59Z"
-        )
-        fmi_url = "https://opendata.fmi.fi/wfs"
-        params = {
-            "service": "WFS",
-            "version": "2.0.0",
-            "request": "getFeature",
-            "storedquery_id": "fmi::observations::weather::daily::simple",
-            "fmisid": FMISID,
-            "parameters": "tmax",
-            "starttime": alku_iso,
-            "endtime": loppu_iso,
-        }
-        res = requests.get(fmi_url, params=params, timeout=15)
+        res = requests.get(url, params=params, timeout=15)
         root = ET.fromstring(res.content)
-
-        for member in root:
-            aika = None
-            arvo = None
-            for elem in member.iter():
-                if elem.tag.endswith("Time"):
-                    aika = elem.text[:10]  # Poimitaan YYYY-MM-DD
-                elif elem.tag.endswith("ParameterValue"):
-                    try:
-                        val = float(elem.text)
-                        if not math.isnan(val):
-                            arvo = val
-                    except (ValueError, TypeError):
-                        pass
-
-            if aika and arvo is not None:
-                fmi_historia[aika] = arvo
+        data = {}
+        # Huomioidaan WFS-nimiavaruudet
+        ns = {'wfs': 'http://www.opengis.net/wfs/2.0', 'omso': 'http://inspire.ec.europa.eu/schemas/omso/3.0'}
+        for member in root.findall('.//wfs:member', ns):
+            aika_elem = member.find('.//omso:Time', ns)
+            arvo_elem = member.find('.//omso:ParameterValue', ns)
+            if aika_elem is not None and arvo_elem is not None:
+                aika = aika_elem.text[:10]
+                if arvo_elem.text != "NaN":
+                    data[aika] = float(arvo_elem.text)
+        return data
     except Exception as e:
-        print(f"FMI-historian noutovirhe: {e}")
+        print(f"FMI-historiavirhe: {e}")
+        return {}
 
-    # 3. Yhdistetään datapisteet (x = malliennuste, y = FMI:n todellinen mittaus)
-    x = []
-    y = []
-    for pvm, raw_f in ennuste_historia.items():
-        if pvm in fmi_historia:
-            x.append(raw_f)
-            y.append(fmi_historia[pvm])
+def hae_om_data(past=True, days=35):
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": LATITUDE, "longitude": LONGITUDE,
+        "daily": ["temperature_2m_max", "cloud_cover_max", "shortwave_radiation_sum"],
+        "models": "ecmwf_ifs025", "timezone": "Europe/Helsinki"
+    }
+    if past:
+        params["past_days"] = days
+        params["forecast_days"] = 0
+    else:
+        params["forecast_days"] = 4 # Tänään + 3 pv
 
-    print(f"Kerätty {len(x)} vertailukelpoista päivää mallin opetukseen.")
-
-    # 4. Lasketaan sovituskerroin (Linear regression)
-    if len(x) >= 7:
-        try:
-            slope, intercept = linear_regression(x, y)
-            print(
-                f"Malli kalibroitu: T_tarkka = {slope:.2f} * T_raaka + ({intercept:.2f})"
-            )
-            return slope, intercept
-        except StatisticsError:
-            pass
-
-    # Varasuunnitelma: jos datapisteitä on vähän, lasketaan pelkkä keskimääräinen virhe
-    if x:
-        keskivirhe = sum(y_i - x_i for x_i, y_i in zip(x, y)) / len(x)
-        print(f"Käytetään keskimääräistä poikkeamaa: {keskivirhe:+.2f} °C")
-        return 1.0, keskivirhe
-
-    return 1.0, 0.0  # Ei korjausta, jos dataa ei saatu
-
-
-def hae_paivan_raakaennuste():
-    """Hakee kuluvan päivän maksimiennusteen suoraan malleista."""
     try:
-        url = "https://api.open-meteo.com/v1/forecast"
-        params = {
-            "latitude": LATITUDE,
-            "longitude": LONGITUDE,
-            "hourly": "temperature_2m",
-            "models": ["ecmwf_ifs025", "dwd_icon"],
-            "forecast_days": 1,
-            "timezone": "Europe/Helsinki",
-        }
-        res = requests.get(url, params=params, timeout=10).json()
-        m1 = max(res["hourly"]["temperature_2m_ecmwf_ifs025"])
-        m2 = max(res["hourly"]["temperature_2m_dwd_icon"])
-        return round((m1 * 0.6) + (m2 * 0.4), 1)
+        res = requests.get(url, params=params, timeout=15).json()
+        d = res["daily"]
+        return {t: (tmax, cloud, rad) for t, tmax, cloud, rad in 
+                zip(d["time"], d["temperature_2m_max"], d["cloud_cover_max"], d["shortwave_radiation_sum"])}
     except Exception as e:
-        print(f"Ennustevirhe: {e}")
-        return None
+        print(f"Open-Meteo virhe: {e}")
+        return {}
 
+# --- MALLIN OPETUS (Heavy-Duty WLS) ---
+def opeta_malli():
+    print("Kalibroidaan AI-mallia (WLS Regression)...")
+    fmi = hae_fmi_historia()
+    om = hae_om_data(past=True)
+    
+    dates = sorted(list(set(fmi.keys()) & set(om.keys())))
+    if len(dates) < 7:
+        print("Liian vähän dataa hienostuneeseen malliin, käytetään oletuksia.")
+        return np.array([1.0, 0.0, 0.0, 0.0])
 
-def hae_fmi_mittaus():
-    """Hakee lentoaseman viimeisimmän 10 minuutin mittauksen."""
+    # Y = FMI Tmax, X = [Raaka_T, Pilvisyys, Säteily, Vakio]
+    Y = np.array([fmi[d] for d in dates])
+    X = np.array([[om[d][0], om[d][1], om[d][2], 1.0] for d in dates])
+    
+    # Painotus: viimeiset 5 päivää ovat 2.5x tärkeämpiä
+    weights = np.ones(len(dates))
+    if len(weights) > 5:
+        weights[-5:] = 2.5
+    W = np.diag(weights)
+
+    try:
+        # Beta = (X^T * W * X)^-1 * X^T * W * Y
+        beta = np.linalg.inv(X.T @ W @ X) @ X.T @ W @ Y
+        print(f"Malli optimoitu. Kertoimet: T={beta[0]:.2f}, Cloud={beta[1]:.2f}, Rad={beta[2]:.4f}")
+        return beta
+    except:
+        return np.array([1.0, 0.0, 0.0, 0.0])
+
+def laske_ennuste(beta, raaka_data):
+    # beta[0]*T + beta[1]*Cloud + beta[2]*Rad + beta[3]
+    return round(beta[0]*raaka_data[0] + beta[1]*raaka_data[1] + beta[2]*raaka_data[2] + beta[3], 1)
+
+def hae_fmi_nykyhetki():
     try:
         url = "https://opendata.fmi.fi/wfs"
         params = {
-            "service": "WFS",
-            "version": "2.0.0",
-            "request": "getFeature",
+            "service": "WFS", "version": "2.0.0", "request": "getFeature",
             "storedquery_id": "fmi::observations::weather::simple",
-            "fmisid": FMISID,
-            "parameters": "t2m",
+            "fmisid": FMISID, "parameters": "t2m"
         }
         res = requests.get(url, params=params, timeout=10)
         root = ET.fromstring(res.content)
-        temp = None
-        for elem in root.iter():
-            if elem.tag.endswith("ParameterValue"):
-                temp = float(elem.text)
-        return temp
-    except Exception as e:
-        print(f"FMI-virhe: {e}")
-        return None
-
+        val = root.findall(".//{http://inspire.ec.europa.eu/schemas/omso/3.0}ParameterValue")[-1].text
+        return float(val)
+    except: return None
 
 # --- PÄÄSILMUKKA ---
-print("Käynnistetään itseoppiva sääbotti...")
+init_db()
+print("Käynnistetään Heavy-Duty Sääbotti v2.0...")
 
-# Opetetaan malli heti käynnistyksessä
-slope, intercept = opeta_korjausmalli()
+beta = opeta_malli()
+ennusteet_raaka = hae_om_data(past=False)
+paivat = sorted(ennusteet_raaka.keys())
 
-raaka = hae_paivan_raakaennuste()
-paivan_ennuste = round((raaka * slope) + intercept, 1) if raaka else None
+# Generoidaan viesti puhelimeen
+ennuste_viesti = "Ennusteet (METAR 101004):\n"
+tanaan_ennuste = None
 
-laheta_puhelimeen(
-    "Sääbotti käynnistetty (ML-kalibroitu)",
-    f"Raakaennuste: {raaka} °C\nKalibroitu huippu: {paivan_ennuste} °C\n(Kerroin: {slope:.2f}, vakio: {intercept:+.2f})",
-)
+for i, pvm in enumerate(paivat):
+    t_ai = laske_ennuste(beta, ennusteet_raaka[pvm])
+    if i == 0: tanaan_ennuste = t_ai
+    ennuste_viesti += f"{pvm}: {t_ai} °C\n"
+
+laheta_puhelimeen("Sää AI: 4 Päivän Ennuste", ennuste_viesti)
 
 toteutunut_huippu = -999.0
 edellinen_paiva = datetime.date.today()
@@ -195,45 +157,40 @@ while True:
     try:
         tanaan = datetime.date.today()
 
-        # Päivän vaihtuessa opetetaan malli uudelleen tuoreimmalla datalla
         if tanaan != edellinen_paiva:
-            slope, intercept = opeta_korjausmalli()
-            raaka = hae_paivan_raakaennuste()
-            paivan_ennuste = (
-                round((raaka * slope) + intercept, 1) if raaka else None
-            )
+            # Tallenna edellisen päivän toteuma tietokantaan vertailua varten
+            if toteutunut_huippu != -999.0:
+                with sqlite3.connect(DB_FILE) as conn:
+                    conn.execute("INSERT OR REPLACE INTO logs VALUES (?, ?, ?, ?)", 
+                                (edellinen_paiva.isoformat(), tanaan_ennuste, toteutunut_huippu, "v2_heavy"))
 
-            laheta_puhelimeen(
-                "Uusi päivä – Päivitetty ennuste",
-                f"Raakaennuste: {raaka} °C -> Kalibroitu: {paivan_ennuste} °C",
-            )
+            # Uusi päivä, uusi opetus
+            beta = opeta_malli()
+            ennusteet_raaka = hae_om_data(past=False)
+            paivat = sorted(ennusteet_raaka.keys())
+            tanaan_ennuste = laske_ennuste(beta, ennusteet_raaka[paivat[0]])
+            
+            msg = "\n".join([f"{p}: {laske_ennuste(beta, ennusteet_raaka[p])} °C" for p in paivat])
+            laheta_puhelimeen("Päivän AI-päivitys", msg)
+            
             toteutunut_huippu = -999.0
             edellinen_paiva = tanaan
 
-        mittari = hae_fmi_mittaus()
+        # Reaaliaikainen seuranta
+        mittari = hae_fmi_nykyhetki()
         klo = datetime.datetime.now().strftime("%H:%M")
 
         if mittari is not None:
-            print(
-                f"[{klo}] Mittari: {mittari:.1f} °C | Kalibroitu ennuste: {paivan_ennuste} °C | Huippu: {toteutunut_huippu:.1f} °C"
-            )
-
             if mittari > toteutunut_huippu:
                 vanha = toteutunut_huippu
                 toteutunut_huippu = mittari
+                print(f"[{klo}] Uusi huippu: {toteutunut_huippu} °C (Ennuste: {tanaan_ennuste})")
 
-                # Hälytys, jos mitattu lämpötila rikkoo kalibroidun ennusteen
-                if (
-                    vanha != -999.0
-                    and paivan_ennuste is not None
-                    and toteutunut_huippu > paivan_ennuste
-                ):
-                    laheta_puhelimeen(
-                        "Ennuste rikkoutui!",
-                        f"Mitattu Helsinki-Vantaalla klo {klo}: {toteutunut_huippu:.1f} °C\nKalibroitu ennuste oli: {paivan_ennuste:.1f} °C (Raaka: {raaka:.1f} °C)",
-                    )
+                if vanha != -999.0 and tanaan_ennuste and toteutunut_huippu > tanaan_ennuste:
+                    laheta_puhelimeen("Hälytys: Ennuste ylittyi!", 
+                                     f"METAR: {toteutunut_huippu} °C\nAI-Ennuste: {tanaan_ennuste} °C")
 
     except Exception as e:
-        print(f"Odottamaton silmukkavirhe: {e}")
+        print(f"Virhe silmukassa: {e}")
 
-    time.sleep(600)
+    time.sleep(600) # 10 minuutin välein
