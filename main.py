@@ -1,206 +1,199 @@
-import datetime
-import math
+"""
+SÄÄBOTTI (main.py)
+Asema: Helsinki-Vantaan lentoasema (FMISID 101004, EFHK)
+Ympäristö: Oracle Cloud VPS (1GB RAM + 2GB Swap)
+Muisti-optimoitu: Puhdas NumPy (ei ulkopuolisia maksullisia AI-palveluita)
+"""
+
+import os
+import sys
 import time
-import xml.etree.ElementTree as ET
-import requests
+import math
 import sqlite3
+import logging
+import requests
 import numpy as np
+from datetime import datetime, timezone
 
-# --- ASETUKSET ---
-KANAVA = "saa-testi666"  # ntfy.sh kanava
-FMISID = 101004          # Helsinki-Vantaa METAR
-LATITUDE = 60.3172
-LONGITUDE = 24.9633
-DB_FILE = "saabotti_v2.db"
-MODEL_VERSION = "2.1_heavy_duty"
+from foreca_engine import fetch_multi_model_forecast, calculate_foreca_consensus
 
-# --- TIETOKANTA ---
+DB_PATH = os.path.expanduser("~/s-testi/saabotti_v2.db")
+STATION_FMISID = "101004"
+STATION_LAT = 60.3172
+STATION_LON = 24.9633
+NTFY_TOPIC = "saabotti_efhk_alerts"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+
 def init_db():
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS logs 
-            (date TEXT PRIMARY KEY, predicted REAL, actual REAL, model_version TEXT)""")
-        conn.commit()
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS weather_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT UNIQUE,
+                obs_temp REAL,
+                raw_temp REAL,
+                cal_temp REAL,
+                foreca_temp REAL,
+                cloud_cover REAL,
+                radiation REAL,
+                humidity REAL,
+                wind_speed REAL,
+                metar_raw TEXT
+            );
+        """)
+        try:
+            conn.execute("ALTER TABLE weather_records ADD COLUMN foreca_temp REAL;")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_weather_time ON weather_records(timestamp);")
+    logging.info("Tietokanta alustettu: %s", DB_PATH)
 
-def laheta_puhelimeen(otsikko, viesti):
+def fetch_metar_efhk():
+    url = "https://aviationweather.gov/api/data/metar?ids=EFHK&format=json"
+    try:
+        r = requests.get(url, timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            if data and len(data) > 0:
+                item = data[0]
+                return {
+                    "raw": item.get("rawOb", ""),
+                    "temp": item.get("temp", None),
+                    "dewp": item.get("dewp", None),
+                    "wind_dir": item.get("wdir", None),
+                    "wind_speed_kt": item.get("wspd", None),
+                    "qnh": item.get("altim", None),
+                    "time": item.get("reportTime", datetime.now(timezone.utc).isoformat())
+                }
+    except Exception as e:
+        logging.warning("METAR haku epäonnistui: %s", e)
+    return None
+
+def fetch_open_meteo_raw():
+    url = (
+        f"https://api.open-meteo.com/v1/forecast?"
+        f"latitude={STATION_LAT}&longitude={STATION_LON}&"
+        f"current=temperature_2m,relative_humidity_2m,cloud_cover,direct_radiation,wind_speed_10m&"
+        f"hourly=temperature_2m,cloud_cover,direct_radiation&forecast_days=2&timezone=Europe%2FHelsinki"
+    )
+    r = requests.get(url, timeout=6)
+    r.raise_for_status()
+    return r.json()
+
+def wls_calibrate(history_rows, current_features, decay_rate=0.04):
+    if len(history_rows) < 8:
+        return current_features[0]
+
+    X_list, y_list, w_list = [], [], []
+    now = datetime.now(timezone.utc)
+
+    for row in history_rows:
+        ts_str, obs_t, raw_t, cloud, rad = row
+        try:
+            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            hours_ago = max(0.0, (now - ts).total_seconds() / 3600.0)
+            weight = math.exp(-decay_rate * hours_ago)
+
+            X_list.append([1.0, float(raw_t), float(cloud) / 100.0, float(rad) / 1000.0])
+            y_list.append(float(obs_t))
+            w_list.append(weight)
+        except Exception:
+            continue
+
+    if len(y_list) < 8:
+        return current_features[0]
+
+    X = np.array(X_list, dtype=np.float32)
+    y = np.array(y_list, dtype=np.float32)
+    W = np.diag(w_list)
+
+    try:
+        XtW = X.T @ W
+        XtWX = XtW @ X
+        XtWy = XtW @ y
+        beta = np.linalg.solve(XtWX, XtWy)
+
+        x_curr = np.array([1.0, current_features[0], current_features[1] / 100.0, current_features[2] / 1000.0])
+        calibrated = float(beta @ x_curr)
+        return round(calibrated, 2)
+    except np.linalg.LinAlgError:
+        return current_features[0]
+
+def send_ntfy_alert(message, title="Sääbotti Hälytys", priority="default"):
     try:
         requests.post(
-            f"https://ntfy.sh/{KANAVA}",
-            data=viesti.encode("utf-8"),
-            headers={"Title": otsikko.encode("utf-8")},
-            timeout=10,
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            data=message.encode("utf-8"),
+            headers={"Title": title.encode("utf-8"), "Priority": priority},
+            timeout=5
         )
     except Exception as e:
-        print(f"Viestivirhe: {e}")
+        logging.warning("ntfy.sh lähetys epäonnistui: %s", e)
 
-# --- DATAN NOUTO (FMI) ---
-def hae_fmi_historia(paivat=35):
-    """Hakee menneet toteutuneet maksimilämpötilat."""
-    tanaan = datetime.date.today()
-    alku = (tanaan - datetime.timedelta(days=paivat)).strftime("%Y-%m-%dT00:00:00Z")
-    loppu = (tanaan - datetime.timedelta(days=1)).strftime("%Y-%m-%dT23:59:59Z")
-    
-    url = "https://opendata.fmi.fi/wfs"
-    params = {
-        "service": "WFS", "version": "2.0.0", "request": "getFeature",
-        "storedquery_id": "fmi::observations::weather::daily::simple",
-        "fmisid": FMISID, "parameters": "tmax", "starttime": alku, "endtime": loppu
-    }
+def run_cycle():
+    metar = fetch_metar_efhk()
+    om = fetch_open_meteo_raw()
+
+    curr_om = om.get("current", {})
+    raw_temp = curr_om.get("temperature_2m", 0.0)
+    cloud_cover = curr_om.get("cloud_cover", 0.0)
+    radiation = curr_om.get("direct_radiation", 0.0)
+    humidity = curr_om.get("relative_humidity_2m", 0.0)
+    wind_speed = curr_om.get("wind_speed_10m", 0.0)
+
+    obs_temp = metar.get("temp") if (metar and metar.get("temp") is not None) else raw_temp
+
     try:
-        res = requests.get(url, params=params, timeout=15)
-        root = ET.fromstring(res.content)
-        data = {}
-        
-        # Universaali parsiminen ilman nimiavaruuslukitusta
-        aika_list = [e.text[:10] for e in root.iter() if e.tag.endswith('Time')]
-        arvo_list = [e.text for e in root.iter() if e.tag.endswith('ParameterValue')]
-        
-        for aika, arvo in zip(aika_list, arvo_list):
-            if arvo != "NaN" and arvo is not None:
-                data[aika] = float(arvo)
-        
-        print(f"[FMI] Historia noudettu: {len(data)} päivää.")
-        return data
+        multi_data = fetch_multi_model_forecast(STATION_LAT, STATION_LON)
+        foreca_res = calculate_foreca_consensus(multi_data)
+        foreca_temp = foreca_res.get("foreca_blended", raw_temp)
     except Exception as e:
-        print(f"[FMI] Virhe historiassa: {e}")
-        return {}
+        logging.warning("Foreca virhe: %s", e)
+        foreca_temp = raw_temp
 
-def hae_fmi_nykyhetki():
-    """Hakee viimeisimmän 10min mittauksen."""
-    url = "https://opendata.fmi.fi/wfs"
-    params = {
-        "service": "WFS", "version": "2.0.0", "request": "getFeature",
-        "storedquery_id": "fmi::observations::weather::simple",
-        "fmisid": FMISID, "parameters": "t2m"
-    }
-    try:
-        res = requests.get(url, params=params, timeout=10)
-        root = ET.fromstring(res.content)
-        vals = [e.text for e in root.iter() if e.tag.endswith('ParameterValue')]
-        return float(vals[-1]) if vals else None
-    except:
-        return None
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT timestamp, obs_temp, raw_temp, cloud_cover, radiation
+            FROM weather_records
+            WHERE obs_temp IS NOT NULL AND raw_temp IS NOT NULL
+            ORDER BY id DESC LIMIT 120;
+        """)
+        rows = cursor.fetchall()
 
-# --- DATAN NOUTO (OPEN-METEO) ---
-def hae_om_data(past=True, days=35):
-    """Hakee ECMWF-mallin raakaennusteet tai historian."""
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": LATITUDE, "longitude": LONGITUDE,
-        "daily": ["temperature_2m_max", "cloud_cover_max", "shortwave_radiation_sum"],
-        "models": "ecmwf_ifs025", "timezone": "Europe/Helsinki"
-    }
-    if past:
-        params["past_days"] = days
-        params["forecast_days"] = 0
-    else:
-        params["forecast_days"] = 4
+    cal_temp = wls_calibrate(rows, [raw_temp, cloud_cover, radiation])
+    now_str = datetime.now(timezone.utc).isoformat()
 
-    try:
-        res = requests.get(url, params=params, timeout=15).json()
-        d = res["daily"]
-        return {t: (tmax, cloud, rad) for t, tmax, cloud, rad in 
-                zip(d["time"], d["temperature_2m_max"], d["cloud_cover_max"], d["shortwave_radiation_sum"])
-                if tmax is not None}
-    except Exception as e:
-        print(f"[OM] Virhe: {e}")
-        return {}
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO weather_records 
+            (timestamp, obs_temp, raw_temp, cal_temp, foreca_temp, cloud_cover, radiation, humidity, wind_speed, metar_raw)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """, (now_str, obs_temp, raw_temp, cal_temp, foreca_temp, cloud_cover, radiation, humidity, wind_speed, metar.get("raw") if metar else ""))
 
-# --- AI-MALLI (WLS) ---
-def opeta_malli():
-    """Laskee dynaamiset kertoimet painotetulla regressiolla."""
-    fmi = hae_fmi_historia()
-    om = hae_om_data(past=True)
-    
-    dates = sorted(list(set(fmi.keys()) & set(om.keys())))
-    print(f"[AI] Yhteisiä datapisteitä opiskeluun: {len(dates)}")
+    logging.info("Sykli valmis | Obs: %s°C, Raw: %s°C, WLS: %s°C, Foreca: %s°C", obs_temp, raw_temp, cal_temp, foreca_temp)
 
-    if len(dates) < 7:
-        print("[AI] VAROITUS: Liian vähän dataa. Käytetään oletuskertoimia.")
-        return np.array([1.0, 0.0, 0.0, 0.0])
+    if obs_temp is not None and obs_temp <= -15.0:
+        send_ntfy_alert(f"Kova pakkanen EFHK: {obs_temp}°C (Foreca: {foreca_temp}°C)", title="Pakkasvaroitus", priority="high")
+    if wind_speed >= 20.0:
+        send_ntfy_alert(f"Voimakas tuuli EFHK: {wind_speed} m/s", title="Tuulivaroitus", priority="high")
 
-    Y = np.array([fmi[d] for d in dates])
-    X = np.array([[om[d][0], om[d][1], om[d][2], 1.0] for d in dates])
-    
-    # Viimeisen 5 päivän painotus (2.5x)
-    weights = np.ones(len(dates))
-    if len(weights) > 5:
-        weights[-5:] = 2.5
-    W = np.diag(weights)
-
-    try:
-        # Ratkaistaan kertoimet: (X^T W X)^-1 X^T W Y
-        beta = np.linalg.inv(X.T @ W @ X) @ X.T @ W @ Y
-        print(f"[AI] Malli kalibroitu: T={beta[0]:.2f}, Pilvi={beta[1]:.2f}, Säteily={beta[2]:.4f}")
-        return beta
-    except:
-        return np.array([1.0, 0.0, 0.0, 0.0])
-
-def ennusta(beta, raaka):
-    """Laskee korjatun lämpötilan kertoimien perusteella."""
-    return round(beta[0]*raaka[0] + beta[1]*raaka[1] + beta[2]*raaka[2] + beta[3], 1)
-
-# --- PÄÄOHJELMA ---
 def main():
     init_db()
-    print(f"Käynnistetään {MODEL_VERSION}...")
-
-    beta = opeta_malli()
-    ennusteet_raaka = hae_om_data(past=False)
-    paivat = sorted(ennusteet_raaka.keys())
-
-    if not paivat:
-        print("Virhe: Ennustedataa ei saatu. Tarkista verkko.")
-        return
-
-    # Alustava ilmoitus
-    tanaan_ennuste = ennusta(beta, ennusteet_raaka[paivat[0]])
-    msg = "AI-Ennusteet (METAR 101004):\n"
-    for pvm in paivat:
-        t_ai = ennusta(beta, ennusteet_raaka[pvm])
-        msg += f"{pvm}: {t_ai} °C\n"
-    laheta_puhelimeen("Sääbotti Aktivoitu", msg)
-
-    toteutunut_huippu = -999.0
-    edellinen_paiva = datetime.date.today()
-
+    logging.info("Sääbotti käynnistetty tausta-ajoon (Screen: 'saabotti')...")
     while True:
         try:
-            tanaan = datetime.date.today()
-
-            # Päivän vaihtuessa
-            if tanaan != edellinen_paiva:
-                if toteutunut_huippu != -999.0:
-                    with sqlite3.connect(DB_FILE) as conn:
-                        conn.execute("INSERT OR REPLACE INTO logs VALUES (?, ?, ?, ?)", 
-                                    (edellinen_paiva.isoformat(), tanaan_ennuste, toteutunut_huippu, MODEL_VERSION))
-                
-                beta = opeta_malli()
-                ennusteet_raaka = hae_om_data(past=False)
-                paivat = sorted(ennusteet_raaka.keys())
-                tanaan_ennuste = ennusta(beta, ennusteet_raaka[paivat[0]])
-                
-                msg = "\n".join([f"{p}: {ennusta(beta, ennusteet_raaka[p])} °C" for p in paivat])
-                laheta_puhelimeen("Uusi Päivä: AI-Ennuste", msg)
-                
-                toteutunut_huippu = -999.0
-                edellinen_paiva = tanaan
-
-            # Seuranta
-            mittari = hae_fmi_nykyhetki()
-            if mittari is not None:
-                if mittari > toteutunut_huippu:
-                    vanha = toteutunut_huippu
-                    toteutunut_huippu = mittari
-                    klo = datetime.datetime.now().strftime("%H:%M")
-                    print(f"[{klo}] Mittari: {mittari} °C | Ennuste: {tanaan_ennuste}")
-
-                    if vanha != -999.0 and toteutunut_huippu > tanaan_ennuste:
-                        laheta_puhelimeen("Ennuste ylittyi!", 
-                                         f"Mitattu: {toteutunut_huippu} °C\nAI-Ennuste: {tanaan_ennuste} °C")
-
+            run_cycle()
         except Exception as e:
-            print(f"Virhe silmukassa: {e}")
-
+            logging.error("Virhe syklissä: %s", e)
         time.sleep(600)
 
 if __name__ == "__main__":
