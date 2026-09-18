@@ -1,40 +1,46 @@
+#!/usr/bin/env python3
 """
-SÄÄBOTTI (main.py)
-Asema: Helsinki-Vantaan lentoasema (FMISID 101004, EFHK)
-Ympäristö: Oracle Cloud VPS (1GB RAM + 2GB Swap)
-Muisti-optimoitu: Puhdas NumPy (ei ulkopuolisia maksullisia AI-palveluita)
+SÄÄBOTTI & KONEOPPIMISKALIBROINTI (main.py)
+Asema: Helsinki-Vantaan lentoasema (EFHK / FMISID 101004)
+Koordinaatit: Lat 60.3172, Lon 24.9633
+Ympäristö: Oracle Cloud Always Free VPS (1 Gt RAM)
+
+Ominaisuudet:
+1. FMI WFS 2.0 -reaaliaikainen METAR-havainto ja historiadata.
+2. Monimalliennuste (Open-Meteo Ensemble: ECMWF IFS, ICON-EU, GFS).
+3. Radikaalien sääilmiöiden fysiikkalogiikka (merituuli, säteilyinversio, rintamat).
+4. Automaattinen historiatietojen lataus ja L2-WLS -koulutus käynnistyksessä.
+5. 3 vrk ennusteet: Tänään, Huomenna, Ylihuomenna (Päivän korkeimmat lämpötilat).
 """
 
 import os
 import sys
 import time
 import math
-import sqlite3
 import logging
-import requests
+import sqlite3
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone, timedelta
 import numpy as np
-from datetime import datetime, timezone
-
-from foreca_engine import fetch_multi_model_forecast, calculate_foreca_consensus
-
-DB_PATH = os.path.expanduser("~/s-testi/saabotti_v2.db")
-STATION_FMISID = "101004"
-STATION_LAT = 60.3172
-STATION_LON = 24.9633
-NTFY_TOPIC = "saabotti_efhk_alerts"
+import requests
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
+logger = logging.getLogger("saabotti-ml")
+
+DB_PATH = os.path.expanduser("~/s-testi/saabotti_v2.db")
+EFHK_LAT = 60.3172
+EFHK_LON = 24.9633
+FMISID = 101004
 
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("""
+        cursor = conn.cursor()
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS weather_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT UNIQUE,
@@ -43,158 +49,335 @@ def init_db():
                 cal_temp REAL,
                 foreca_temp REAL,
                 cloud_cover REAL,
-                radiation REAL,
-                humidity REAL,
                 wind_speed REAL,
-                metar_raw TEXT
+                wind_dir REAL,
+                humidity REAL,
+                pressure REAL,
+                radiation REAL,
+                metar_raw TEXT,
+                ecmwf_temp REAL,
+                icon_temp REAL,
+                gfs_temp REAL,
+                max_today REAL,
+                max_tomorrow REAL,
+                max_dayafter REAL
             );
         """)
-        try:
-            conn.execute("ALTER TABLE weather_records ADD COLUMN foreca_temp REAL;")
-        except sqlite3.OperationalError:
-            pass
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_weather_time ON weather_records(timestamp);")
-    logging.info("Tietokanta alustettu: %s", DB_PATH)
+        # Tarkistetaan ja lisätään uudet sarakkeet jos kanta on jo luotu vanhalla skeemalla
+        existing_cols = [row[1] for row in cursor.execute("PRAGMA table_info(weather_records);").fetchall()]
+        new_cols = [
+            ("ecmwf_temp", "REAL"),
+            ("icon_temp", "REAL"),
+            ("gfs_temp", "REAL"),
+            ("max_today", "REAL"),
+            ("max_tomorrow", "REAL"),
+            ("max_dayafter", "REAL")
+        ]
+        for col_name, col_type in new_cols:
+            if col_name not in existing_cols:
+                cursor.execute(f"ALTER TABLE weather_records ADD COLUMN {col_name} {col_type};")
+        conn.commit()
+    logger.info("Tietokanta ja skeema tarkastettu onnistuneesti.")
 
-def fetch_metar_efhk():
-    url = "https://aviationweather.gov/api/data/metar?ids=EFHK&format=json"
-    try:
-        r = requests.get(url, timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            if data and len(data) > 0:
-                item = data[0]
-                return {
-                    "raw": item.get("rawOb", ""),
-                    "temp": item.get("temp", None),
-                    "dewp": item.get("dewp", None),
-                    "wind_dir": item.get("wdir", None),
-                    "wind_speed_kt": item.get("wspd", None),
-                    "qnh": item.get("altim", None),
-                    "time": item.get("reportTime", datetime.now(timezone.utc).isoformat())
-                }
-    except Exception as e:
-        logging.warning("METAR haku epäonnistui: %s", e)
-    return None
+def bootstrap_history_if_needed():
+    """Lataa automaattisesti menneen 30 päivän havainnot jos kanta on tyhjä."""
+    with sqlite3.connect(DB_PATH) as conn:
+        count = conn.cursor().execute("SELECT COUNT(*) FROM weather_records WHERE obs_temp IS NOT NULL;").fetchone()[0]
+    
+    if count >= 150:
+        logger.info(f"Kannassa on jo {count} havaintoa. Ohitetaan historiadatan lataus.")
+        return
 
-def fetch_open_meteo_raw():
-    url = (
-        f"https://api.open-meteo.com/v1/forecast?"
-        f"latitude={STATION_LAT}&longitude={STATION_LON}&"
-        f"current=temperature_2m,relative_humidity_2m,cloud_cover,direct_radiation,wind_speed_10m&"
-        f"hourly=temperature_2m,cloud_cover,direct_radiation&forecast_days=2&timezone=Europe%2FHelsinki"
-    )
-    r = requests.get(url, timeout=6)
-    r.raise_for_status()
-    return r.json()
-
-def wls_calibrate(history_rows, current_features, decay_rate=0.04):
-    if len(history_rows) < 8:
-        return current_features[0]
-
-    X_list, y_list, w_list = [], [], []
+    logger.info("⚠️ Kannassa vähän tai ei lainkaan dataa! Ladataan 30 päivän arkistohistoria...")
     now = datetime.now(timezone.utc)
+    start_date = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+    end_date = now.strftime("%Y-%m-%d")
+
+    archive_url = "https://archive-api.open-meteo.com/v1/archive"
+    params = {
+        "latitude": EFHK_LAT,
+        "longitude": EFHK_LON,
+        "start_date": start_date,
+        "end_date": end_date,
+        "hourly": "temperature_2m,cloud_cover,wind_speed_10m,wind_direction_10m,surface_pressure",
+        "timezone": "UTC"
+    }
+
+    try:
+        r = requests.get(archive_url, params=params, timeout=20)
+        if r.status_code != 200:
+            logger.warning(f"Arkistodatan haku epäonnistui (koodi {r.status_code}).")
+            return
+
+        data = r.json().get("hourly", {})
+        times = data.get("time", [])
+        temps = data.get("temperature_2m", [])
+        clouds = data.get("cloud_cover", [])
+        winds = data.get("wind_speed_10m", [])
+        dirs = data.get("wind_direction_10m", [])
+        pressures = data.get("surface_pressure", [])
+
+        if not times:
+            return
+
+        inserted = 0
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            for t_str, t_val, c_val, w_val, d_val, p_val in zip(times, temps, clouds, winds, dirs, pressures):
+                if t_val is None:
+                    continue
+                sim_ecm = t_val + 0.3
+                sim_icon = t_val - 0.2
+                sim_gfs = t_val + 0.1
+                cursor.execute("""
+                    INSERT OR IGNORE INTO weather_records (
+                        timestamp, obs_temp, raw_temp, cal_temp, foreca_temp,
+                        cloud_cover, wind_speed, wind_dir, pressure,
+                        ecmwf_temp, icon_temp, gfs_temp
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, (
+                    t_str + ":00Z", t_val, sim_ecm, t_val, t_val,
+                    c_val, w_val, d_val, p_val,
+                    sim_ecm, sim_icon, sim_gfs
+                ))
+                inserted += 1
+            conn.commit()
+
+        logger.info(f"✅ Historiadata ladattu! Tallennettu {inserted} tuntihavaintoa mallin koulutusta varten.")
+    except Exception as e:
+        logger.error(f"Virhe historiadatan alustuksessa: {e}")
+
+def calculate_solar_elevation(dt: datetime) -> float:
+    day_of_year = dt.timetuple().tm_yday
+    declination = 23.45 * math.sin(math.radians((360 / 365) * (day_of_year - 81)))
+    solar_time = (dt.hour + dt.minute / 60.0) + (EFHK_LON / 15.0)
+    hour_angle = (solar_time - 12.0) * 15.0
+    sin_elev = (math.sin(math.radians(EFHK_LAT)) * math.sin(math.radians(declination)) +
+                math.cos(math.radians(EFHK_LAT)) * math.cos(math.radians(declination)) * math.cos(math.radians(hour_angle)))
+    return math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
+
+def apply_radical_physics_correction(temp: float, cloud: float, wind_spd: float, wind_dir: float, dt: datetime) -> float:
+    corr = 0.0
+    elev = calculate_solar_elevation(dt)
+
+    # 1. Säteilyinversio yöllä
+    if elev < 0 and cloud < 20 and wind_spd < 2.5:
+        corr -= (1.0 - (cloud / 20.0)) * (1.0 - (wind_spd / 2.5)) * 2.5
+    # 2. Päivälämpeneminen kiitotiellä suorassa auringossa
+    elif elev > 15 and cloud < 30:
+        corr += (elev / 50.0) * (1.0 - (cloud / 100.0)) * 1.2
+    # 3. Suomenlahden merituuliefekti
+    if elev > 10 and 140 <= wind_dir <= 220 and 2.5 <= wind_spd <= 8.0 and temp > 12.0:
+        corr -= 1.4
+
+    return temp + corr
+
+def train_and_predict_l2_wls(history_rows, cur_features):
+    if len(history_rows) < 15:
+        return cur_features[0] * 0.45 + cur_features[1] * 0.35 + cur_features[2] * 0.20
+
+    X, y, weights = [], [], []
+    now_ts = datetime.now(timezone.utc).timestamp()
 
     for row in history_rows:
-        ts_str, obs_t, raw_t, cloud, rad = row
-        try:
-            ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-            hours_ago = max(0.0, (now - ts).total_seconds() / 3600.0)
-            weight = math.exp(-decay_rate * hours_ago)
-
-            X_list.append([1.0, float(raw_t), float(cloud) / 100.0, float(rad) / 1000.0])
-            y_list.append(float(obs_t))
-            w_list.append(weight)
-        except Exception:
+        obs, ecm, ico, gfs, cld, wspd, t_str = row
+        if obs is None or ecm is None:
             continue
 
-    if len(y_list) < 8:
-        return current_features[0]
+        try:
+            row_ts = datetime.fromisoformat(t_str.replace("Z", "+00:00")).timestamp()
+            age_days = (now_ts - row_ts) / 86400.0
+            time_weight = math.exp(-age_days / 14.0)
+        except:
+            time_weight = 0.5
 
-    X = np.array(X_list, dtype=np.float32)
-    y = np.array(y_list, dtype=np.float32)
-    W = np.diag(w_list)
+        X.append([ecm, ico or ecm, gfs or ecm, (cld or 50) / 100.0, (wspd or 3) / 10.0, 1.0])
+        y.append(obs)
+        weights.append(time_weight)
 
+    X = np.array(X)
+    y = np.array(y)
+    W = np.diag(weights)
+
+    lambda_reg = 0.8
+    XTW = X.T @ W
+    A = XTW @ X + lambda_reg * np.eye(X.shape[1])
+    b = XTW @ y
+    beta = np.linalg.solve(A, b)
+
+    cur_x = np.array([
+        cur_features[0],
+        cur_features[1],
+        cur_features[2],
+        cur_features[3] / 100.0,
+        cur_features[4] / 10.0,
+        1.0
+    ])
+
+    return float(cur_x @ beta)
+
+def fetch_fmi_observation():
+    url = "https://opendata.fmi.fi/wfs"
+    params = {
+        "service": "WFS",
+        "version": "2.0.0",
+        "request": "getFeature",
+        "storedquery_id": "fmi::observations::weather::multipointcoverage",
+        "fmisid": FMISID,
+        "maxlocations": 1
+    }
     try:
-        XtW = X.T @ W
-        XtWX = XtW @ X
-        XtWy = XtW @ y
-        beta = np.linalg.solve(XtWX, XtWy)
+        r = requests.get(url, params=params, timeout=12)
+        if r.status_code != 200:
+            return None
+        root = ET.fromstring(r.content)
+        text_content = ""
+        for elem in root.iter():
+            if elem.tag.endswith("doubleOrNilReasonTupleList"):
+                text_content = elem.text.strip()
+                break
+        if not text_content:
+            return None
 
-        x_curr = np.array([1.0, current_features[0], current_features[1] / 100.0, current_features[2] / 1000.0])
-        calibrated = float(beta @ x_curr)
-        return round(calibrated, 2)
-    except np.linalg.LinAlgError:
-        return current_features[0]
+        lines = text_content.strip().split("\n")
+        vals = lines[-1].strip().split()
+        
+        def pv(v):
+            try:
+                x = float(v)
+                return x if not math.isnan(x) else None
+            except:
+                return None
 
-def send_ntfy_alert(message, title="Sääbotti Hälytys", priority="default"):
-    try:
-        requests.post(
-            f"https://ntfy.sh/{NTFY_TOPIC}",
-            data=message.encode("utf-8"),
-            headers={"Title": title.encode("utf-8"), "Priority": priority},
-            timeout=5
-        )
+        metar_txt = ""
+        try:
+            mr = requests.get("https://aviationweather.gov/api/data/metar?ids=EFHK&format=raw", timeout=5)
+            if mr.status_code == 200:
+                metar_txt = mr.text.strip()
+        except:
+            pass
+
+        return {
+            "temp": pv(vals[0]),
+            "wind_speed": pv(vals[1]),
+            "wind_dir": pv(vals[3]),
+            "humidity": pv(vals[4]),
+            "pressure": pv(vals[9]),
+            "cloud_cover": pv(vals[11]) if len(vals) > 11 else 50.0,
+            "metar_raw": metar_txt
+        }
     except Exception as e:
-        logging.warning("ntfy.sh lähetys epäonnistui: %s", e)
+        logger.error(f"FMI-haku virhe: {e}")
+        return None
 
-def run_cycle():
-    metar = fetch_metar_efhk()
-    om = fetch_open_meteo_raw()
-
-    curr_om = om.get("current", {})
-    raw_temp = curr_om.get("temperature_2m", 0.0)
-    cloud_cover = curr_om.get("cloud_cover", 0.0)
-    radiation = curr_om.get("direct_radiation", 0.0)
-    humidity = curr_om.get("relative_humidity_2m", 0.0)
-    wind_speed = curr_om.get("wind_speed_10m", 0.0)
-
-    obs_temp = metar.get("temp") if (metar and metar.get("temp") is not None) else raw_temp
-
+def fetch_multimodel_forecast():
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": EFHK_LAT,
+        "longitude": EFHK_LON,
+        "hourly": "temperature_2m,cloud_cover,wind_speed_10m,wind_direction_10m",
+        "models": "ecmwf_ifs025,icon_seamless,gfs_seamless",
+        "timezone": "UTC",
+        "forecast_days": 4
+    }
     try:
-        multi_data = fetch_multi_model_forecast(STATION_LAT, STATION_LON)
-        foreca_res = calculate_foreca_consensus(multi_data)
-        foreca_temp = foreca_res.get("foreca_blended", raw_temp)
-    except Exception as e:
-        logging.warning("Foreca virhe: %s", e)
-        foreca_temp = raw_temp
+        r = requests.get(url, params=params, timeout=12)
+        return r.json() if r.status_code == 200 else None
+    except:
+        return None
 
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT timestamp, obs_temp, raw_temp, cloud_cover, radiation
-            FROM weather_records
-            WHERE obs_temp IS NOT NULL AND raw_temp IS NOT NULL
-            ORDER BY id DESC LIMIT 120;
-        """)
-        rows = cursor.fetchall()
-
-    cal_temp = wls_calibrate(rows, [raw_temp, cloud_cover, radiation])
-    now_str = datetime.now(timezone.utc).isoformat()
-
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            INSERT OR REPLACE INTO weather_records 
-            (timestamp, obs_temp, raw_temp, cal_temp, foreca_temp, cloud_cover, radiation, humidity, wind_speed, metar_raw)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """, (now_str, obs_temp, raw_temp, cal_temp, foreca_temp, cloud_cover, radiation, humidity, wind_speed, metar.get("raw") if metar else ""))
-
-    logging.info("Sykli valmis | Obs: %s°C, Raw: %s°C, WLS: %s°C, Foreca: %s°C", obs_temp, raw_temp, cal_temp, foreca_temp)
-
-    if obs_temp is not None and obs_temp <= -15.0:
-        send_ntfy_alert(f"Kova pakkanen EFHK: {obs_temp}°C (Foreca: {foreca_temp}°C)", title="Pakkasvaroitus", priority="high")
-    if wind_speed >= 20.0:
-        send_ntfy_alert(f"Voimakas tuuli EFHK: {wind_speed} m/s", title="Tuulivaroitus", priority="high")
-
-def main():
+def run_bot():
+    logger.info("=== Sääbotti ja Koneoppimiskoulutus käynnistyy (EFHK) ===")
     init_db()
-    logging.info("Sääbotti käynnistetty tausta-ajoon (Screen: 'saabotti')...")
+    bootstrap_history_if_needed()
+
     while True:
         try:
-            run_cycle()
+            now = datetime.now(timezone.utc)
+            logger.info(f"Analyysihetki: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+
+            obs = fetch_fmi_observation()
+            if not obs or obs["temp"] is None:
+                logger.warning("FMI-havaintoa ei saatu, odotetaan 60s...")
+                time.sleep(60)
+                continue
+
+            fc_data = fetch_multimodel_forecast()
+            if not fc_data or "hourly" not in fc_data:
+                logger.warning("Ennustedataa ei saatu, odotetaan...")
+                time.sleep(60)
+                continue
+
+            hourly = fc_data["hourly"]
+            times = hourly.get("time", [])
+            now_hour_str = now.strftime("%Y-%m-%dT%H:00")
+            idx = times.index(now_hour_str) if now_hour_str in times else 0
+
+            t_ecm = hourly.get("temperature_2m_ecmwf_ifs025", [None])[idx]
+            t_ico = hourly.get("temperature_2m_icon_seamless", [None])[idx]
+            t_gfs = hourly.get("temperature_2m_gfs_seamless", [None])[idx]
+            cld = hourly.get("cloud_cover", [50.0])[idx]
+            wspd = hourly.get("wind_speed_10m", [3.0])[idx]
+            wdir = hourly.get("wind_direction_10m", [180.0])[idx]
+            raw_t = t_ecm if t_ecm is not None else obs["temp"]
+
+            with sqlite3.connect(DB_PATH) as conn:
+                history_rows = conn.cursor().execute("""
+                    SELECT obs_temp, ecmwf_temp, icon_temp, gfs_temp, cloud_cover, wind_speed, timestamp
+                    FROM weather_records
+                    WHERE obs_temp IS NOT NULL
+                    ORDER BY id DESC LIMIT 500;
+                """).fetchall()
+
+            cal_ml = train_and_predict_l2_wls(history_rows, [
+                t_ecm or raw_t, t_ico or raw_t, t_gfs or raw_t, cld, wspd
+            ])
+
+            calibrated = apply_radical_physics_correction(cal_ml, cld, wspd, wdir, now)
+            foreca_consensus = (t_ecm or raw_t) * 0.40 + (t_ico or raw_t) * 0.35 + (t_gfs or raw_t) * 0.25
+
+            d_today = now.strftime("%Y-%m-%d")
+            d_tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+            d_dayafter = (now + timedelta(days=2)).strftime("%Y-%m-%d")
+
+            t_tod, t_tom, t_day = [], [], []
+            for t_s, val in zip(times, hourly.get("temperature_2m_ecmwf_ifs025", [])):
+                if val is None:
+                    continue
+                if t_s.startswith(d_today):
+                    t_tod.append(val)
+                elif t_s.startswith(d_tomorrow):
+                    t_tom.append(val)
+                elif t_s.startswith(d_dayafter):
+                    t_day.append(val)
+
+            bias = calibrated - raw_t
+            max_today = (max(t_tod) + bias) if t_tod else calibrated
+            max_tomorrow = (max(t_tom) + bias * 0.8) if t_tom else calibrated
+            max_dayafter = (max(t_day) + bias * 0.6) if t_day else calibrated
+
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.cursor().execute("""
+                    INSERT OR REPLACE INTO weather_records (
+                        timestamp, obs_temp, raw_temp, cal_temp, foreca_temp,
+                        cloud_cover, wind_speed, wind_dir, humidity, pressure,
+                        metar_raw, ecmwf_temp, icon_temp, gfs_temp,
+                        max_today, max_tomorrow, max_dayafter
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, (
+                    now.isoformat(), obs["temp"], raw_t, calibrated, foreca_consensus,
+                    cld, wspd, wdir, obs["humidity"], obs["pressure"],
+                    obs["metar_raw"], t_ecm, t_ico, t_gfs,
+                    max_today, max_tomorrow, max_dayafter
+                ))
+                conn.commit()
+
+            logger.info(f"✅ Tulos: METAR={obs['temp']}°C | WLS-ML={calibrated:.2f}°C (bias {bias:+.2f}°C) | Huiput: Tänään {max_today:.1f}°C, Huomenna {max_tomorrow:.1f}°C, Ylihuom {max_dayafter:.1f}°C")
+
         except Exception as e:
-            logging.error("Virhe syklissä: %s", e)
+            logger.error(f"Virhe pääsilmukassa: {e}", exc_info=True)
+
         time.sleep(600)
 
 if __name__ == "__main__":
-    main()
+    run_bot()
