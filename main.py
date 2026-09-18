@@ -3,6 +3,7 @@
 SÄÄBOTTI & KONEOPPIMISKALIBROINTI (main.py)
 Asema: Helsinki-Vantaan lentoasema (EFHK / FMISID 101004)
 Koordinaatit: Lat 60.3172, Lon 24.9633
+Ympäristö: Oracle Cloud Always Free VPS (1 Gt RAM)
 """
 
 import os
@@ -51,12 +52,14 @@ def init_db():
                 icon_temp REAL,
                 gfs_temp REAL,
                 max_today REAL,
+                remaining_today_max REAL,
                 max_tomorrow REAL,
-                max_dayafter REAL
+                max_dayafter REAL,
+                prob_today TEXT,
+                prob_tomorrow TEXT,
+                prob_dayafter TEXT
             );
         """)
-        
-        # Lisätään mahdollisesti puuttuvat sarakkeet vanhaan kantaan
         existing_cols = [row[1] for row in cursor.execute("PRAGMA table_info(weather_records);").fetchall()]
         required_cols = [
             ("obs_temp", "REAL"),
@@ -74,28 +77,59 @@ def init_db():
             ("icon_temp", "REAL"),
             ("gfs_temp", "REAL"),
             ("max_today", "REAL"),
+            ("remaining_today_max", "REAL"),
             ("max_tomorrow", "REAL"),
-            ("max_dayafter", "REAL")
+            ("max_dayafter", "REAL"),
+            ("prob_today", "TEXT"),
+            ("prob_tomorrow", "TEXT"),
+            ("prob_dayafter", "TEXT")
         ]
         for col_name, col_type in required_cols:
             if col_name not in existing_cols:
                 try:
                     cursor.execute(f"ALTER TABLE weather_records ADD COLUMN {col_name} {col_type};")
-                    logger.info(f"Lisätty sarake: {col_name}")
+                    logger.info(f"Lisätty puuttunut sarake: {col_name}")
                 except Exception as e:
                     logger.warning(f"Sarakkeen {col_name} lisäys: {e}")
         conn.commit()
     logger.info("Tietokanta ja skeema tarkastettu onnistuneesti.")
 
 def safe_get(arr, idx, default=None):
-    """Turvallinen arvon haku listasta ilman IndexError-riskiä."""
     if arr and isinstance(arr, list) and 0 <= idx < len(arr):
         val = arr[idx]
         return val if val is not None else default
     return default
 
+def calculate_metar_probabilities(mean_temp: float, sigma: float = 0.65):
+    """Laskee METAR-kokonaislukujen todennäköisyysjakauman virhefunktion (erf) avulla."""
+    if mean_temp is None or math.isnan(mean_temp):
+        return "N/A"
+    
+    base_int = int(round(mean_temp))
+    candidates = [base_int - 1, base_int, base_int + 1]
+    
+    probs = {}
+    total_p = 0.0
+    for k in candidates:
+        z1 = (k - 0.5 - mean_temp) / (sigma * math.sqrt(2))
+        z2 = (k + 0.5 - mean_temp) / (sigma * math.sqrt(2))
+        p = 0.5 * (math.erf(z2) - math.erf(z1))
+        probs[k] = max(0.0, p)
+        total_p += probs[k]
+
+    if total_p <= 0:
+        return f"{base_int}°C: 100%"
+
+    sorted_probs = sorted(probs.items(), key=lambda x: x[1], reverse=True)
+    parts = []
+    for val, p in sorted_probs:
+        pct = int(round((p / total_p) * 100))
+        if pct >= 10:
+            parts.append(f"{val}°C: {pct}%")
+            
+    return " | ".join(parts) if parts else f"{base_int}°C: 100%"
+
 def bootstrap_history_if_needed():
-    """Lataa automaattisesti menneen 30 päivän havainnot jos kanta on tyhjä."""
     with sqlite3.connect(DB_PATH) as conn:
         count = conn.cursor().execute("SELECT COUNT(*) FROM weather_records WHERE obs_temp IS NOT NULL;").fetchone()[0]
     
@@ -103,7 +137,7 @@ def bootstrap_history_if_needed():
         logger.info(f"Kannassa on jo {count} havaintoa. Ohitetaan historiadatan lataus.")
         return
 
-    logger.info("⚠️ Kannassa vähän tai ei lainkaan dataa! Ladataan 30 päivän arkistohistoria...")
+    logger.info("⚠️ Kannassa vähän dataa! Ladataan 30 päivän arkistohistoria...")
     now = datetime.now(timezone.utc)
     start_date = (now - timedelta(days=30)).strftime("%Y-%m-%d")
     end_date = now.strftime("%Y-%m-%d")
@@ -121,7 +155,6 @@ def bootstrap_history_if_needed():
     try:
         r = requests.get(archive_url, params=params, timeout=20)
         if r.status_code != 200:
-            logger.warning(f"Arkistodatan haku epäonnistui (koodi {r.status_code}).")
             return
 
         data = r.json().get("hourly", {})
@@ -148,19 +181,19 @@ def bootstrap_history_if_needed():
                     INSERT OR IGNORE INTO weather_records (
                         timestamp, obs_temp, raw_temp, cal_temp, foreca_temp,
                         cloud_cover, wind_speed, wind_dir, pressure,
-                        ecmwf_temp, icon_temp, gfs_temp
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        ecmwf_temp, icon_temp, gfs_temp, max_today, remaining_today_max
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """, (
                     t_str + ":00Z", t_val, sim_ecm, t_val, t_val,
                     c_val, w_val, d_val, p_val,
-                    sim_ecm, sim_icon, sim_gfs
+                    sim_ecm, sim_icon, sim_gfs, t_val, t_val
                 ))
                 inserted += 1
             conn.commit()
 
-        logger.info(f"✅ Historiadata ladattu! Tallennettu {inserted} tuntihavaintoa mallin koulutusta varten.")
+        logger.info(f"✅ Historiadata ladattu! Tallennettu {inserted} tuntihavaintoa.")
     except Exception as e:
-        logger.error(f"Virhe historiadatan alustuksessa: {e}")
+        logger.error(f"Virhe historiatietojen latauksessa: {e}")
 
 def calculate_solar_elevation(dt: datetime) -> float:
     day_of_year = dt.timetuple().tm_yday
@@ -175,13 +208,10 @@ def apply_radical_physics_correction(temp: float, cloud: float, wind_spd: float,
     corr = 0.0
     elev = calculate_solar_elevation(dt)
 
-    # 1. Säteilyinversio
     if elev < 0 and cloud < 20 and wind_spd < 2.5:
         corr -= (1.0 - (cloud / 20.0)) * (1.0 - (wind_spd / 2.5)) * 2.5
-    # 2. Päivälämpeneminen kiitotiellä
     elif elev > 15 and cloud < 30:
         corr += (elev / 50.0) * (1.0 - (cloud / 100.0)) * 1.2
-    # 3. Suomenlahden merituuliefekti
     if elev > 10 and 140 <= wind_dir <= 220 and 2.5 <= wind_spd <= 8.0 and temp > 12.0:
         corr -= 1.4
 
@@ -331,7 +361,6 @@ def run_bot():
             now_hour_str = now.strftime("%Y-%m-%dT%H:00")
             idx = times.index(now_hour_str) if now_hour_str in times else 0
 
-            # Turvalliset arvot safe_get-funktiolla
             t_ecm = safe_get(hourly.get("temperature_2m_ecmwf_ifs025"), idx, obs["temp"])
             t_ico = safe_get(hourly.get("temperature_2m_icon_seamless"), idx, t_ecm)
             t_gfs = safe_get(hourly.get("temperature_2m_gfs_seamless"), idx, t_ecm)
@@ -359,39 +388,71 @@ def run_bot():
             d_tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
             d_dayafter = (now + timedelta(days=2)).strftime("%Y-%m-%d")
 
+            # Haetaan päivän suurin tähänastinen havainto
+            with sqlite3.connect(DB_PATH) as conn:
+                max_obs_row = conn.cursor().execute("""
+                    SELECT MAX(obs_temp) FROM weather_records 
+                    WHERE timestamp >= ? AND obs_temp IS NOT NULL;
+                """, (d_today + "T00:00:00",)).fetchone()
+                observed_max_today = max_obs_row[0] if (max_obs_row and max_obs_row[0] is not None) else obs["temp"]
+
             t_tod, t_tom, t_day = [], [], []
+            remaining_today_temps = []
+
             for t_s, val in zip(times, hourly.get("temperature_2m_ecmwf_ifs025", [])):
                 if val is None:
                     continue
                 if t_s.startswith(d_today):
                     t_tod.append(val)
+                    if t_s >= now_hour_str:
+                        remaining_today_temps.append(val)
                 elif t_s.startswith(d_tomorrow):
                     t_tom.append(val)
                 elif t_s.startswith(d_dayafter):
                     t_day.append(val)
 
             bias = calibrated - raw_t
-            max_today = (max(t_tod) + bias) if t_tod else calibrated
-            max_tomorrow = (max(t_tom) + bias * 0.8) if t_tom else calibrated
-            max_dayafter = (max(t_day) + bias * 0.6) if t_day else calibrated
+            
+            # Koko päivän virallinen huippu
+            pred_day_peak = (max(t_tod) + bias) if t_tod else calibrated
+            max_today = max(float(observed_max_today), float(obs["temp"]), float(pred_day_peak))
 
+            # Loppupäivän jäljellä oleva huippu
+            if remaining_today_temps:
+                pred_rem = max(remaining_today_temps) + bias
+                remaining_today_max = max(float(obs["temp"]), float(pred_rem))
+            else:
+                remaining_today_max = float(obs["temp"])
+
+            # Huomisen ja ylihuomisen huiput
+            max_tomorrow = (max(t_tom) + bias) if t_tom else calibrated
+            max_dayafter = (max(t_day) + bias) if t_day else calibrated
+
+            # Todennäköisyydet METAR-kokonaisluvuille
+            prob_today = calculate_metar_probabilities(max_today)
+            prob_tomorrow = calculate_metar_probabilities(max_tomorrow)
+            prob_dayafter = calculate_metar_probabilities(max_dayafter)
+
+            # TALLENNUS: Tarkalleen 21 saraketta ja 21 kysymysmerkkiä (?)
             with sqlite3.connect(DB_PATH) as conn:
                 conn.cursor().execute("""
                     INSERT OR REPLACE INTO weather_records (
                         timestamp, obs_temp, raw_temp, cal_temp, foreca_temp,
                         cloud_cover, wind_speed, wind_dir, humidity, pressure,
                         metar_raw, ecmwf_temp, icon_temp, gfs_temp,
-                        max_today, max_tomorrow, max_dayafter
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        max_today, remaining_today_max, max_tomorrow, max_dayafter,
+                        prob_today, prob_tomorrow, prob_dayafter
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """, (
                     now.isoformat(), obs["temp"], raw_t, calibrated, foreca_consensus,
                     cld, wspd, wdir, obs["humidity"], obs["pressure"],
                     obs["metar_raw"], t_ecm, t_ico, t_gfs,
-                    max_today, max_tomorrow, max_dayafter
+                    max_today, remaining_today_max, max_tomorrow, max_dayafter,
+                    prob_today, prob_tomorrow, prob_dayafter
                 ))
                 conn.commit()
 
-            logger.info(f"✅ Tulos: METAR={obs['temp']}°C | WLS-ML={calibrated:.2f}°C (bias {bias:+.2f}°C) | Huiput: Tänään {max_today:.1f}°C, Huomenna {max_tomorrow:.1f}°C, Ylihuom {max_dayafter:.1f}°C")
+            logger.info(f"✅ Tulos: METAR={obs['temp']}°C | Huiput: Tänään {max_today:.1f}°C [{prob_today}] (loppupäivä {remaining_today_max:.1f}°C) | Huom {max_tomorrow:.1f}°C [{prob_tomorrow}]")
 
         except Exception as e:
             logger.error(f"Virhe pääsilmukassa: {e}", exc_info=True)
