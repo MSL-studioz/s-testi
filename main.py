@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-SÄÄBOTTI & KONEOPPIMISKALIBROINTI (main.py) - KORJATTU VERSIO
+SÄÄBOTTI & KONEOPPIMISKALIBROINTI (main.py)
 Asema: Helsinki-Vantaan lentoasema (EFHK / FMISID 101004)
+Koordinaatit: Lat 60.3172, Lon 24.9633
 """
 
 import os
@@ -55,7 +56,7 @@ def init_db():
             );
         """)
         
-        # Varmistetaan KAIKKI sarakkeet dynaamisesti olemassa olevaan tauluun
+        # Lisätään mahdollisesti puuttuvat sarakkeet vanhaan kantaan
         existing_cols = [row[1] for row in cursor.execute("PRAGMA table_info(weather_records);").fetchall()]
         required_cols = [
             ("obs_temp", "REAL"),
@@ -80,14 +81,14 @@ def init_db():
             if col_name not in existing_cols:
                 try:
                     cursor.execute(f"ALTER TABLE weather_records ADD COLUMN {col_name} {col_type};")
-                    logger.info(f"Lisätty puuttunut sarake: {col_name}")
+                    logger.info(f"Lisätty sarake: {col_name}")
                 except Exception as e:
                     logger.warning(f"Sarakkeen {col_name} lisäys: {e}")
         conn.commit()
     logger.info("Tietokanta ja skeema tarkastettu onnistuneesti.")
 
 def safe_get(arr, idx, default=None):
-    """Turvallinen listasta haku ilman IndexError-riskiä."""
+    """Turvallinen arvon haku listasta ilman IndexError-riskiä."""
     if arr and isinstance(arr, list) and 0 <= idx < len(arr):
         val = arr[idx]
         return val if val is not None else default
@@ -180,7 +181,7 @@ def apply_radical_physics_correction(temp: float, cloud: float, wind_spd: float,
     # 2. Päivälämpeneminen kiitotiellä
     elif elev > 15 and cloud < 30:
         corr += (elev / 50.0) * (1.0 - (cloud / 100.0)) * 1.2
-    # 3. Suomenlahden merituuli
+    # 3. Suomenlahden merituuliefekti
     if elev > 10 and 140 <= wind_dir <= 220 and 2.5 <= wind_spd <= 8.0 and temp > 12.0:
         corr -= 1.4
 
@@ -330,7 +331,7 @@ def run_bot():
             now_hour_str = now.strftime("%Y-%m-%dT%H:00")
             idx = times.index(now_hour_str) if now_hour_str in times else 0
 
-            # Turvalliset arvot safe_get-funktiolla (estää IndexErrorin)
+            # Turvalliset arvot safe_get-funktiolla
             t_ecm = safe_get(hourly.get("temperature_2m_ecmwf_ifs025"), idx, obs["temp"])
             t_ico = safe_get(hourly.get("temperature_2m_icon_seamless"), idx, t_ecm)
             t_gfs = safe_get(hourly.get("temperature_2m_gfs_seamless"), idx, t_ecm)
@@ -372,7 +373,6 @@ def run_bot():
             bias = calibrated - raw_t
             max_today = (max(t_tod) + bias) if t_tod else calibrated
             max_tomorrow = (max(t_tom) + bias * 0.8) if t_tom else calibrated
-            max_dayafter = (max(t_day) + bias * 0.6) if t_day after if 'after' in locals() else (max(t_day) + bias * 0.6) if t_day else calibrated
             max_dayafter = (max(t_day) + bias * 0.6) if t_day else calibrated
 
             with sqlite3.connect(DB_PATH) as conn:
