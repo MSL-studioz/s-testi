@@ -5,6 +5,7 @@ Käynnistys: python3 -m streamlit run app.py --server.port 8501 --server.address
 """
 
 import os
+import math
 import sqlite3
 import pandas as pd
 import streamlit as st
@@ -23,10 +24,22 @@ st.markdown("""
     .main { background-color: #0b0f19; color: #f1f5f9; }
     .stMetric { background: #131b2e; padding: 14px 18px; border-radius: 12px; border: 1px solid #1e293b; }
     .metar-banner { background: #0f172a; border-left: 4px solid #38bdf8; padding: 12px 16px; border-radius: 8px; font-family: monospace; font-size: 13px; margin-bottom: 16px; border: 1px solid #1e293b; }
+    .prob-badge { background: #1e293b; color: #38bdf8; border: 1px solid #334155; padding: 4px 8px; border-radius: 6px; font-family: monospace; font-size: 12px; font-weight: 700; margin-top: 6px; display: inline-block; }
 </style>
 """, unsafe_allow_html=True)
 
 DB_PATH = os.path.expanduser("~/s-testi/saabotti_v2.db")
+
+def calc_probs(mean_temp):
+    """Fallback-laskenta jos kannassa ei ole vielä todennäköisyyssaraketta."""
+    if mean_temp is None:
+        return "17°C: 70% | 18°C: 30%"
+    k = int(round(mean_temp))
+    diff = abs(mean_temp - k)
+    p_main = int(round((1.0 - diff) * 85))
+    p_sub = 100 - p_main
+    other = k + 1 if mean_temp > k else k - 1
+    return f"{k}°C: {p_main}% | {other}°C: {p_sub}%"
 
 @st.cache_data(ttl=60)
 def load_data():
@@ -41,7 +54,8 @@ def load_data():
     df['datetime'] = pd.to_datetime(df['timestamp'], errors='coerce')
     df = df.dropna(subset=['datetime']).sort_values('datetime')
     
-    for col in ['obs_temp', 'raw_temp', 'cal_temp', 'foreca_temp', 'cloud_cover', 'wind_speed', 'humidity', 'radiation', 'max_today', 'max_tomorrow', 'max_dayafter']:
+    num_cols = ['obs_temp', 'raw_temp', 'cal_temp', 'foreca_temp', 'cloud_cover', 'wind_speed', 'humidity', 'radiation', 'max_today', 'remaining_today_max', 'max_tomorrow', 'max_dayafter']
+    for col in num_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
@@ -70,10 +84,14 @@ else:
     foreca_t = latest['foreca_temp'] if ('foreca_temp' in latest and pd.notnull(latest['foreca_temp'])) else cal_t
     bias_foreca = foreca_t - raw_t
 
-    # Päivien korkeimmat lämpötilat (tietokannasta tai fallbackina lasketut)
-    max_1 = latest.get('max_today') if (pd.notnull(latest.get('max_today'))) else (obs_t + 1.2)
+    max_1 = latest.get('max_today') if (pd.notnull(latest.get('max_today'))) else max(obs_t, 17.0)
+    rem_1 = latest.get('remaining_today_max') if (pd.notnull(latest.get('remaining_today_max'))) else obs_t
     max_2 = latest.get('max_tomorrow') if (pd.notnull(latest.get('max_tomorrow'))) else (obs_t + 0.4)
     max_3 = latest.get('max_dayafter') if (pd.notnull(latest.get('max_dayafter'))) else (obs_t - 0.5)
+
+    prob_1 = latest.get('prob_today') if (pd.notnull(latest.get('prob_today')) and latest.get('prob_today')) else calc_probs(max_1)
+    prob_2 = latest.get('prob_tomorrow') if (pd.notnull(latest.get('prob_tomorrow')) and latest.get('prob_tomorrow')) else calc_probs(max_2)
+    prob_3 = latest.get('prob_dayafter') if (pd.notnull(latest.get('prob_dayafter')) and latest.get('prob_dayafter')) else calc_probs(max_3)
 
     # 1. METAR STATUS-BANNERI
     metar_str = latest.get('metar_raw')
@@ -90,30 +108,30 @@ else:
 
     st.write("")
 
-    # 3. PÄIVÄN KORKEIMMAT LÄMPÖTILAT (HERO-KORTIT)
-    st.subheader("☀️ Ilmatieteen Laitos (FMI): Päivän Korkeimmat Lämpötilat")
+    # 3. PÄIVÄN KORKEIMMAT LÄMPÖTILAT JA METAR-KOKONAIISLUKUARVIOT
+    st.subheader("☀️ Päivän Korkeimmat Lämpötilat & METAR-Kokonaislukuarviot")
 
     c_today, c_tomorrow, c_dayafter = st.columns(3)
 
     with c_today:
         st.markdown(f"""
         <div style="background: linear-gradient(180deg, #131b2e 0%, #0d1527 100%); border: 1px solid #38bdf8; border-radius: 14px; padding: 18px; box-shadow: 0 4px 20px rgba(56, 189, 248, 0.15);">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                 <span style="background: rgba(56, 189, 248, 0.2); color: #38bdf8; font-weight: 700; font-size: 11px; padding: 3px 10px; border-radius: 20px; text-transform: uppercase;">Tänään</span>
                 <span style="color: #94a3b8; font-size: 13px; font-family: monospace;">18.09.</span>
             </div>
-            <div style="color: #f59e0b; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px;">Päivän korkein lämpötila</div>
-            <div style="display: flex; align-items: baseline; gap: 8px; margin: 4px 0 12px 0;">
+            <div style="color: #f59e0b; font-size: 11px; font-weight: 700; text-transform: uppercase;">Koko päivän virallinen huippu</div>
+            <div style="display: flex; align-items: baseline; gap: 8px; margin: 2px 0 6px 0;">
                 <span style="font-size: 38px; font-weight: 900; color: #fbbf24; line-height: 1;">+{max_1:.1f}°C</span>
                 <span style="color: #94a3b8; font-size: 12px;">klo 15:00</span>
             </div>
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; border-top: 1px solid #1e293b; padding-top: 10px; font-size: 12px;">
-                <div><span style="color: #64748b; font-size: 10px; display: block;">FMI Havainto Nyt</span><b style="color: #38bdf8;">{obs_t:.1f}°C</b></div>
-                <div><span style="color: #64748b; font-size: 10px; display: block;">WLS Kalibroitu</span><b style="color: #4ade80;">{cal_t:.1f}°C</b></div>
+            <div style="background: rgba(15, 23, 42, 0.6); padding: 6px 10px; border-radius: 8px; border: 1px solid #1e293b; margin-bottom: 10px;">
+                <span style="color: #94a3b8; font-size: 11px; display: block;">🎯 Todennäköisyys METAR-kokonaisluvulle:</span>
+                <span style="color: #38bdf8; font-weight: 700; font-family: monospace; font-size: 13px;">{prob_1}</span>
             </div>
-            <div style="margin-top: 8px; font-size: 11px; color: #94a3b8; display: flex; justify-content: space-between;">
-                <span>Pilvisyys ~{latest.get('cloud_cover', 40):.0f}%</span>
-                <span style="color: #38bdf8;">Tuuli {latest.get('wind_speed', 3):.1f} m/s</span>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; border-top: 1px solid #1e293b; padding-top: 8px; font-size: 12px;">
+                <div><span style="color: #64748b; font-size: 10px; display: block;">Loppupäivän arvio</span><b style="color: #f97316;">+{rem_1:.1f}°C</b></div>
+                <div><span style="color: #64748b; font-size: 10px; display: block;">METAR Nyt</span><b style="color: #4ade80;">{obs_t:.1f}°C</b></div>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -121,22 +139,22 @@ else:
     with c_tomorrow:
         st.markdown(f"""
         <div style="background: linear-gradient(180deg, #131b2e 0%, #0d1527 100%); border: 1px solid #1e293b; border-radius: 14px; padding: 18px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                 <span style="background: #1e293b; color: #cbd5e1; font-weight: 700; font-size: 11px; padding: 3px 10px; border-radius: 20px; text-transform: uppercase;">Huomenna</span>
                 <span style="color: #94a3b8; font-size: 13px; font-family: monospace;">19.09.</span>
             </div>
-            <div style="color: #f59e0b; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px;">Päivän korkein lämpötila</div>
-            <div style="display: flex; align-items: baseline; gap: 8px; margin: 4px 0 12px 0;">
+            <div style="color: #f59e0b; font-size: 11px; font-weight: 700; text-transform: uppercase;">Päivän ennustettu huippu</div>
+            <div style="display: flex; align-items: baseline; gap: 8px; margin: 2px 0 6px 0;">
                 <span style="font-size: 38px; font-weight: 900; color: #fbbf24; line-height: 1;">+{max_2:.1f}°C</span>
                 <span style="color: #94a3b8; font-size: 12px;">klo 14:00</span>
             </div>
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; border-top: 1px solid #1e293b; padding-top: 10px; font-size: 12px;">
+            <div style="background: rgba(15, 23, 42, 0.6); padding: 6px 10px; border-radius: 8px; border: 1px solid #1e293b; margin-bottom: 10px;">
+                <span style="color: #94a3b8; font-size: 11px; display: block;">🎯 Todennäköisyys METAR-kokonaisluvulle:</span>
+                <span style="color: #38bdf8; font-weight: 700; font-family: monospace; font-size: 13px;">{prob_2}</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; border-top: 1px solid #1e293b; padding-top: 8px; font-size: 12px;">
                 <div><span style="color: #64748b; font-size: 10px; display: block;">Foreca Arvio</span><b style="color: #2dd4bf;">+{max_2 - 0.2:.1f}°C</b></div>
                 <div><span style="color: #64748b; font-size: 10px; display: block;">FMI Ennuste</span><b style="color: #38bdf8;">+{max_2:.1f}°C</b></div>
-            </div>
-            <div style="margin-top: 8px; font-size: 11px; color: #94a3b8; display: flex; justify-content: space-between;">
-                <span>Pilvisyys ~55%</span>
-                <span style="color: #cbd5e1;">Tuuli 4 m/s</span>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -144,29 +162,29 @@ else:
     with c_dayafter:
         st.markdown(f"""
         <div style="background: linear-gradient(180deg, #131b2e 0%, #0d1527 100%); border: 1px solid #1e293b; border-radius: 14px; padding: 18px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                 <span style="background: #1e293b; color: #cbd5e1; font-weight: 700; font-size: 11px; padding: 3px 10px; border-radius: 20px; text-transform: uppercase;">Ylihuomenna</span>
                 <span style="color: #94a3b8; font-size: 13px; font-family: monospace;">20.09.</span>
             </div>
-            <div style="color: #f59e0b; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px;">Päivän korkein lämpötila</div>
-            <div style="display: flex; align-items: baseline; gap: 8px; margin: 4px 0 12px 0;">
+            <div style="color: #f59e0b; font-size: 11px; font-weight: 700; text-transform: uppercase;">Päivän ennustettu huippu</div>
+            <div style="display: flex; align-items: baseline; gap: 8px; margin: 2px 0 6px 0;">
                 <span style="font-size: 38px; font-weight: 900; color: #fbbf24; line-height: 1;">+{max_3:.1f}°C</span>
                 <span style="color: #94a3b8; font-size: 12px;">klo 14:30</span>
             </div>
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; border-top: 1px solid #1e293b; padding-top: 10px; font-size: 12px;">
+            <div style="background: rgba(15, 23, 42, 0.6); padding: 6px 10px; border-radius: 8px; border: 1px solid #1e293b; margin-bottom: 10px;">
+                <span style="color: #94a3b8; font-size: 11px; display: block;">🎯 Todennäköisyys METAR-kokonaisluvulle:</span>
+                <span style="color: #38bdf8; font-weight: 700; font-family: monospace; font-size: 13px;">{prob_3}</span>
+            </div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; border-top: 1px solid #1e293b; padding-top: 8px; font-size: 12px;">
                 <div><span style="color: #64748b; font-size: 10px; display: block;">Foreca Arvio</span><b style="color: #2dd4bf;">+{max_3 - 0.3:.1f}°C</b></div>
                 <div><span style="color: #64748b; font-size: 10px; display: block;">FMI Ennuste</span><b style="color: #38bdf8;">+{max_3:.1f}°C</b></div>
-            </div>
-            <div style="margin-top: 8px; font-size: 11px; color: #94a3b8; display: flex; justify-content: space-between;">
-                <span>Pilvisyys ~40%</span>
-                <span style="color: #cbd5e1;">Tuuli 3 m/s</span>
             </div>
         </div>
         """, unsafe_allow_html=True)
 
     st.write("")
 
-    # 4. KORJATTU PLOTLY-GRAAFI
+    # 4. PLOTLY-GRAAFI
     st.subheader("📈 Lämpötilakäyrät: FMI, METAR & Koneoppimismallit")
     
     fig = go.Figure()
